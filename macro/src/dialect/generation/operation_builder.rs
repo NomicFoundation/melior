@@ -71,6 +71,7 @@ pub fn generate_operation_builder(builder: &OperationBuilder) -> TokenStream {
         pub struct #identifier<'c, #(#type_parameters),*> {
             builder: ::melior::ir::operation::OperationBuilder<'c>,
             context: &'c ::melior::Context,
+            inherent_attributes: ::std::vec::Vec<(&'static str, ::melior::ir::Attribute<'c>)>,
             _state: ::std::marker::PhantomData<(#(#type_parameters),*)>,
         }
 
@@ -99,7 +100,39 @@ fn generate_field_fn(builder: &OperationBuilder, field: &impl OperationField) ->
     // arguments.
     let add_arguments = field.add_arguments(identifier);
 
-    if field.is_optional() {
+    if field.is_ods_declared() {
+        // ODS-declared fields (attributes) are stashed into
+        // `inherent_attributes` and applied in `build()` via the op-aware
+        // attribute API, not added to the operation state.
+        if field.is_optional() {
+            let parameters = builder.type_state().parameters().collect::<Vec<_>>();
+            quote! {
+                impl<'c, #(#parameters),*> #builder_identifier<'c, #(#parameters),*> {
+                    pub fn #identifier(mut self, #argument) -> #builder_identifier<'c, #(#parameters),*> {
+                        self.inherent_attributes.push(#add_arguments);
+                        self
+                    }
+                }
+            }
+        } else {
+            let parameters = builder.type_state().parameters_without(field.name());
+            let arguments_set = builder.type_state().arguments_with(field.name(), true);
+            let arguments_unset = builder.type_state().arguments_with(field.name(), false);
+            quote! {
+                impl<'c, #(#parameters),*> #builder_identifier<'c, #(#arguments_unset),*> {
+                    pub fn #identifier(mut self, #argument) -> #builder_identifier<'c, #(#arguments_set),*> {
+                        self.inherent_attributes.push(#add_arguments);
+                        #builder_identifier {
+                            context: self.context,
+                            builder: self.builder,
+                            inherent_attributes: self.inherent_attributes,
+                            _state: Default::default(),
+                        }
+                    }
+                }
+            }
+        }
+    } else if field.is_optional() {
         let parameters = builder.type_state().parameters().collect::<Vec<_>>();
 
         quote! {
@@ -121,6 +154,7 @@ fn generate_field_fn(builder: &OperationBuilder, field: &impl OperationField) ->
                     #builder_identifier {
                         context: self.context,
                         builder: self.builder.#add_identifier(#add_arguments),
+                        inherent_attributes: self.inherent_attributes,
                         _state: Default::default(),
                     }
                 }
@@ -179,6 +213,7 @@ fn generate_same_operands_first_fn(
                         builder: self.builder
                             .add_results(&[#(#result_type_copies),*])
                             .#add_identifier(#add_arguments),
+                        inherent_attributes: self.inherent_attributes,
                         _state: Default::default(),
                     }
                 }
@@ -212,8 +247,8 @@ fn generate_first_attr_derived_fn(builder: &OperationBuilder, field: &Attribute)
                 pub fn #identifier(mut self, #argument) -> #builder_identifier<'c, #(#parameters),*> {
                     let result_type = #type_access;
                     self.builder = self.builder
-                        .add_results(&[#(#result_type_copies),*])
-                        .add_attributes(#add_arguments);
+                        .add_results(&[#(#result_type_copies),*]);
+                    self.inherent_attributes.push(#add_arguments);
                     self
                 }
             }
@@ -224,13 +259,15 @@ fn generate_first_attr_derived_fn(builder: &OperationBuilder, field: &Attribute)
         let arguments_unset = builder.type_state().arguments_with(field.name(), false);
         quote! {
             impl<'c, #(#parameters),*> #builder_identifier<'c, #(#arguments_unset),*> {
-                pub fn #identifier(self, #argument) -> #builder_identifier<'c, #(#arguments_set),*> {
+                pub fn #identifier(mut self, #argument) -> #builder_identifier<'c, #(#arguments_set),*> {
                     let result_type = #type_access;
+                    self.builder = self.builder
+                        .add_results(&[#(#result_type_copies),*]);
+                    self.inherent_attributes.push(#add_arguments);
                     #builder_identifier {
                         context: self.context,
-                        builder: self.builder
-                            .add_results(&[#(#result_type_copies),*])
-                            .add_attributes(#add_arguments),
+                        builder: self.builder,
+                        inherent_attributes: self.inherent_attributes,
                         _state: Default::default(),
                     }
                 }
@@ -244,16 +281,47 @@ fn generate_build_fn(builder: &OperationBuilder) -> TokenStream {
     let arguments = builder.type_state().arguments_with_all(true);
     let operation_identifier = format_ident!("{}", &builder.operation().name());
     let error = format!("should be a valid {operation_identifier}");
-    let maybe_infer = matches!(
+    let uses_interface_inference = matches!(
         builder.operation().type_inference(),
         Some(TypeInference::Interface)
-    )
-    .then_some(quote! { .enable_result_type_inference() });
+    );
+
+    // `TypeInference::Interface` ops call `inferReturnTypes` inside
+    // `mlirOperationCreate`, which reads from `OpState.attributes`. ODS-
+    // declared attributes must therefore be on the `OperationBuilder` state
+    // *before* `.build()` for such ops. For all other ops we apply them
+    // after `.build()` via `set_inherent_attribute`, so they land in the
+    // op's property storage on dialects that use `usePropertiesForAttributes`.
+    let build_body = if uses_interface_inference {
+        quote! {
+            let mut builder = self.builder;
+            for (name, attribute) in self.inherent_attributes {
+                builder = builder.add_attributes(&[(
+                    ::melior::ir::Identifier::new(self.context, name),
+                    attribute,
+                )]);
+            }
+            let operation = builder
+                .enable_result_type_inference()
+                .build()
+                .expect("valid operation");
+        }
+    } else {
+        quote! {
+            use ::melior::ir::operation::OperationMutLike;
+
+            let mut operation = self.builder.build().expect("valid operation");
+            for (name, attribute) in self.inherent_attributes {
+                operation.set_inherent_attribute(name, attribute);
+            }
+        }
+    };
 
     quote! {
         impl<'c> #identifier<'c, #(#arguments),*> {
             pub fn build(self) -> #operation_identifier<'c> {
-                self.builder #maybe_infer.build().expect("valid operation").try_into().expect(#error)
+                #build_body
+                operation.try_into().expect(#error)
             }
         }
     }
@@ -263,6 +331,7 @@ fn generate_new_fn(builder: &OperationBuilder) -> TokenStream {
     let identifier = builder.identifier();
     let name = &builder.operation().full_operation_name();
     let arguments = builder.type_state().arguments_with_all(false);
+    let attribute_count = builder.operation().attributes().count();
 
     quote! {
         impl<'c> #identifier<'c, #(#arguments),*> {
@@ -270,6 +339,7 @@ fn generate_new_fn(builder: &OperationBuilder) -> TokenStream {
                 Self {
                     context,
                     builder: ::melior::ir::operation::OperationBuilder::new(#name, location),
+                    inherent_attributes: ::std::vec::Vec::with_capacity(#attribute_count),
                     _state: Default::default(),
                 }
             }
