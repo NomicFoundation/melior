@@ -9,4 +9,8 @@ pub trait OperationField {
     fn return_type(&self) -> Type;
     fn is_optional(&self) -> bool;
     fn add_arguments(&self, name: &Ident) -> TokenStream;
+
+    fn is_ods_declared(&self) -> bool {
+        false
+    }
 }

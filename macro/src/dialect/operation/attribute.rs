@@ -155,10 +155,11 @@ impl OperationField for Attribute<'_> {
         let name_string = &self.name;
 
         quote! {
-            &[(
-                ::melior::ir::Identifier::new(self.context, #name_string),
-                #name.into(),
-            )]
+            (#name_string, #name.into())
         }
+    }
+
+    fn is_ods_declared(&self) -> bool {
+        true
     }
 }

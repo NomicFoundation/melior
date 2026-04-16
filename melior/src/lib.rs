@@ -278,4 +278,33 @@ mod tests {
         assert!(module.as_operation().verify());
         insta::assert_snapshot!(module.as_operation());
     }
+
+    #[cfg(feature = "ods-dialects")]
+    #[test]
+    fn ods_builder_sets_inherent_attribute() {
+        use crate::{
+            dialect::ods::arith::ConstantOperation,
+            ir::operation::OperationLike,
+        };
+
+        let context = Context::new();
+        load_all_dialects(&context);
+
+        let location = Location::unknown(&context);
+        let integer_type = IntegerType::new(&context, 32).into();
+        let value = IntegerAttribute::new(integer_type, 42).into();
+
+        let operation = ConstantOperation::builder(&context, location)
+            .result(integer_type)
+            .value(value)
+            .build();
+
+        assert!(operation.as_operation().has_inherent_attribute("value"));
+        assert_eq!(
+            operation.as_operation().inherent_attribute("value").unwrap(),
+            value,
+        );
+
+        assert!(operation.as_operation().verify());
+    }
 }
