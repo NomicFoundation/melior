@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["macro", "melior"]
+members = ["macro", "melior", "melior-verify"]
 
 [workspace.package]
 edition = "2024"

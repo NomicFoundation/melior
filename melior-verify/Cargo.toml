@@ -1,0 +1,12 @@
+[package]
+name = "melior-verify"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Downstream verification harness for solx-driven melior changes. melior's own
+# `--lib` tests cannot link against the solx LLVM fork's install (it ships no
+# `libMLIRExecutionEngine.a`), but a downstream crate that never references the
+# execution engine links fine via `-dead_strip` — exactly how solx-mlir links.
+[dependencies]
+melior = { path = "../melior", features = ["ods-dialects", "helpers"] }
