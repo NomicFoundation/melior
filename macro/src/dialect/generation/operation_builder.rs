@@ -1,16 +1,26 @@
 use crate::dialect::operation::{
-    Attribute, OperationBuilder, OperationElement, OperationField, TypeInference,
+    Attribute, OperationBuilder, OperationElement, OperationField, TypeInference, VariadicKind,
 };
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 
 pub fn generate_operation_builder(builder: &OperationBuilder) -> TokenStream {
+    // `AttrSizedOperandSegments` ops require an `operand_segment_sizes` attribute
+    // recording how many operands belong to each (single/optional/variadic) group.
+    // When present, every operand carries `VariadicKind::AttributeSized`; the
+    // builder tracks the per-group counts and synthesizes the attribute in
+    // `build()` (see `generate_build_fn`), so callers no longer hand-set it.
+    let attribute_sized_operands = builder
+        .operation()
+        .operands()
+        .any(|operand| *operand.variadic_kind() == VariadicKind::AttributeSized);
+
     let result_fns = match builder.operation().type_inference() {
         Some(_) => Default::default(),
         None => builder
             .operation()
             .results()
-            .map(|result| generate_field_fn(builder, result))
+            .map(|result| generate_field_fn(builder, result, None))
             .collect::<Vec<_>>(),
     };
     let infer_from_operands = matches!(
@@ -25,19 +35,20 @@ pub fn generate_operation_builder(builder: &OperationBuilder) -> TokenStream {
             if i == 0 && infer_from_operands {
                 generate_same_operands_first_fn(builder, operand)
             } else {
-                generate_field_fn(builder, operand)
+                let segment = attribute_sized_operands.then_some((i, operand.is_variadic()));
+                generate_field_fn(builder, operand, segment)
             }
         })
         .collect::<Vec<_>>();
     let region_fns = builder
         .operation()
         .regions()
-        .map(|region| generate_field_fn(builder, region))
+        .map(|region| generate_field_fn(builder, region, None))
         .collect::<Vec<_>>();
     let successor_fns = builder
         .operation()
         .successors()
-        .map(|successor| generate_field_fn(builder, successor))
+        .map(|successor| generate_field_fn(builder, successor, None))
         .collect::<Vec<_>>();
     let infer_from_first_attr = matches!(
         builder.operation().type_inference(),
@@ -51,7 +62,7 @@ pub fn generate_operation_builder(builder: &OperationBuilder) -> TokenStream {
             if i == 0 && infer_from_first_attr {
                 generate_first_attr_derived_fn(builder, attribute)
             } else {
-                generate_field_fn(builder, attribute)
+                generate_field_fn(builder, attribute, None)
             }
         })
         .collect::<Vec<_>>();
@@ -72,6 +83,7 @@ pub fn generate_operation_builder(builder: &OperationBuilder) -> TokenStream {
             builder: ::melior::ir::operation::OperationBuilder<'c>,
             context: &'c ::melior::Context,
             inherent_attributes: ::std::vec::Vec<(&'static str, ::melior::ir::Attribute<'c>)>,
+            operand_segment_sizes: ::std::vec::Vec<i32>,
             _state: ::std::marker::PhantomData<(#(#type_parameters),*)>,
         }
 
@@ -88,7 +100,15 @@ pub fn generate_operation_builder(builder: &OperationBuilder) -> TokenStream {
 }
 
 // TODO Split this function for different kinds of fields.
-fn generate_field_fn(builder: &OperationBuilder, field: &impl OperationField) -> TokenStream {
+// `segment`, when `Some((index, is_variadic))`, marks this field as operand group
+// `index` of an `AttrSizedOperandSegments` op; the generated setter records that
+// group's operand count into `operand_segment_sizes` (variadic → slice length,
+// single/optional → 1). It is `None` for every other field.
+fn generate_field_fn(
+    builder: &OperationBuilder,
+    field: &impl OperationField,
+    segment: Option<(usize, bool)>,
+) -> TokenStream {
     let builder_identifier = builder.identifier();
     let identifier = field.singular_identifier();
     let parameter_type = field.parameter_type();
@@ -99,6 +119,14 @@ fn generate_field_fn(builder: &OperationBuilder, field: &impl OperationField) ->
     // are always variadic, so we need to create a slice or `Vec` for singular
     // arguments.
     let add_arguments = field.add_arguments(identifier);
+
+    let segment_write = match segment {
+        Some((index, true)) => {
+            quote! { self.operand_segment_sizes[#index] = #identifier.len() as i32; }
+        }
+        Some((index, false)) => quote! { self.operand_segment_sizes[#index] = 1i32; },
+        None => quote! {},
+    };
 
     if field.is_ods_declared() {
         // ODS-declared fields (attributes) are stashed into
@@ -126,6 +154,7 @@ fn generate_field_fn(builder: &OperationBuilder, field: &impl OperationField) ->
                             context: self.context,
                             builder: self.builder,
                             inherent_attributes: self.inherent_attributes,
+                            operand_segment_sizes: self.operand_segment_sizes,
                             _state: Default::default(),
                         }
                     }
@@ -138,6 +167,7 @@ fn generate_field_fn(builder: &OperationBuilder, field: &impl OperationField) ->
         quote! {
             impl<'c, #(#parameters),*> #builder_identifier<'c, #(#parameters),*> {
                 pub fn #identifier(mut self, #argument) -> #builder_identifier<'c, #(#parameters),*> {
+                    #segment_write
                     self.builder = self.builder.#add_identifier(#add_arguments);
                     self
                 }
@@ -147,14 +177,22 @@ fn generate_field_fn(builder: &OperationBuilder, field: &impl OperationField) ->
         let parameters = builder.type_state().parameters_without(field.name());
         let arguments_set = builder.type_state().arguments_with(field.name(), true);
         let arguments_unset = builder.type_state().arguments_with(field.name(), false);
+        // A segment-tracking setter mutates `operand_segment_sizes` before moving it.
+        let receiver = if segment.is_some() {
+            quote! { mut self }
+        } else {
+            quote! { self }
+        };
 
         quote! {
             impl<'c, #(#parameters),*> #builder_identifier<'c, #(#arguments_unset),*> {
-                pub fn #identifier(self, #argument) -> #builder_identifier<'c, #(#arguments_set),*> {
+                pub fn #identifier(#receiver, #argument) -> #builder_identifier<'c, #(#arguments_set),*> {
+                    #segment_write
                     #builder_identifier {
                         context: self.context,
                         builder: self.builder.#add_identifier(#add_arguments),
                         inherent_attributes: self.inherent_attributes,
+                        operand_segment_sizes: self.operand_segment_sizes,
                         _state: Default::default(),
                     }
                 }
@@ -214,6 +252,7 @@ fn generate_same_operands_first_fn(
                             .add_results(&[#(#result_type_copies),*])
                             .#add_identifier(#add_arguments),
                         inherent_attributes: self.inherent_attributes,
+                        operand_segment_sizes: self.operand_segment_sizes,
                         _state: Default::default(),
                     }
                 }
@@ -268,6 +307,7 @@ fn generate_first_attr_derived_fn(builder: &OperationBuilder, field: &Attribute)
                         context: self.context,
                         builder: self.builder,
                         inherent_attributes: self.inherent_attributes,
+                        operand_segment_sizes: self.operand_segment_sizes,
                         _state: Default::default(),
                     }
                 }
@@ -286,6 +326,29 @@ fn generate_build_fn(builder: &OperationBuilder) -> TokenStream {
         Some(TypeInference::Interface)
     );
 
+    // For `AttrSizedOperandSegments` ops, fold the per-group operand counts the
+    // setters recorded into the required `operand_segment_sizes` attribute, applied
+    // alongside the other inherent attributes below. Slots default to 0, so an
+    // unset optional operand correctly contributes a 0 segment.
+    let attribute_sized_operands = builder
+        .operation()
+        .operands()
+        .any(|operand| *operand.variadic_kind() == VariadicKind::AttributeSized);
+    let segment_prelude = if attribute_sized_operands {
+        quote! {
+            inherent_attributes.push((
+                "operand_segment_sizes",
+                ::melior::ir::attribute::DenseI32ArrayAttribute::new(
+                    self.context,
+                    &self.operand_segment_sizes,
+                )
+                .into(),
+            ));
+        }
+    } else {
+        quote! {}
+    };
+
     // `TypeInference::Interface` ops call `inferReturnTypes` inside
     // `mlirOperationCreate`, which reads from `OpState.attributes`. ODS-
     // declared attributes must therefore be on the `OperationBuilder` state
@@ -294,8 +357,10 @@ fn generate_build_fn(builder: &OperationBuilder) -> TokenStream {
     // op's property storage on dialects that use `usePropertiesForAttributes`.
     let build_body = if uses_interface_inference {
         quote! {
+            let mut inherent_attributes = self.inherent_attributes;
+            #segment_prelude
             let mut builder = self.builder;
-            for (name, attribute) in self.inherent_attributes {
+            for (name, attribute) in inherent_attributes {
                 builder = builder.add_attributes(&[(
                     ::melior::ir::Identifier::new(self.context, name),
                     attribute,
@@ -310,8 +375,10 @@ fn generate_build_fn(builder: &OperationBuilder) -> TokenStream {
         quote! {
             use ::melior::ir::operation::OperationMutLike;
 
+            let mut inherent_attributes = self.inherent_attributes;
+            #segment_prelude
             let mut operation = self.builder.build().expect("valid operation");
-            for (name, attribute) in self.inherent_attributes {
+            for (name, attribute) in inherent_attributes {
                 operation.set_inherent_attribute(name, attribute);
             }
         }
@@ -333,6 +400,20 @@ fn generate_new_fn(builder: &OperationBuilder) -> TokenStream {
     let arguments = builder.type_state().arguments_with_all(false);
     let attribute_count = builder.operation().attributes().count();
 
+    // `AttrSizedOperandSegments` ops carry one segment slot per operand group,
+    // pre-zeroed so an unset optional operand keeps its 0. Other ops keep the
+    // accumulator empty (no allocation) — `build()` ignores it.
+    let attribute_sized_operands = builder
+        .operation()
+        .operands()
+        .any(|operand| *operand.variadic_kind() == VariadicKind::AttributeSized);
+    let operand_segment_sizes = if attribute_sized_operands {
+        let operand_count = builder.operation().operand_len();
+        quote! { ::std::vec![0i32; #operand_count] }
+    } else {
+        quote! { ::std::vec::Vec::new() }
+    };
+
     quote! {
         impl<'c> #identifier<'c, #(#arguments),*> {
             pub fn new(context: &'c ::melior::Context, location: ::melior::ir::Location<'c>) -> Self {
@@ -340,6 +421,7 @@ fn generate_new_fn(builder: &OperationBuilder) -> TokenStream {
                     context,
                     builder: ::melior::ir::operation::OperationBuilder::new(#name, location),
                     inherent_attributes: ::std::vec::Vec::with_capacity(#attribute_count),
+                    operand_segment_sizes: #operand_segment_sizes,
                     _state: Default::default(),
                 }
             }
