@@ -3,7 +3,9 @@ use crate::{
     Context, Error, StringRef,
     ir::{Type, TypeLike},
 };
-use mlir_sys::{MlirAttribute, mlirStringAttrGet, mlirStringAttrGetValue, mlirStringAttrTypedGet};
+use mlir_sys::{
+    MlirAttribute, MlirStringRef, mlirStringAttrGet, mlirStringAttrGetValue, mlirStringAttrTypedGet,
+};
 
 /// A string attribute.
 #[derive(Clone, Copy, Hash)]
@@ -28,6 +30,19 @@ impl<'c> StringAttribute<'c> {
             Self::from_raw(mlirStringAttrTypedGet(
                 r#type.to_raw(),
                 StringRef::new(string).to_raw(),
+            ))
+        }
+    }
+
+    /// Creates a string attribute from bytes, which need not be valid UTF-8.
+    pub fn from_bytes(context: &'c Context, bytes: &[u8]) -> Self {
+        unsafe {
+            Self::from_raw(mlirStringAttrGet(
+                context.to_raw(),
+                MlirStringRef {
+                    data: bytes.as_ptr().cast(),
+                    length: bytes.len(),
+                },
             ))
         }
     }
