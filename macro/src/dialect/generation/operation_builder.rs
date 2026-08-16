@@ -61,6 +61,8 @@ pub fn generate_operation_builder(builder: &OperationBuilder) -> TokenStream {
         .map(|(i, attribute)| {
             if i == 0 && infer_from_first_attr {
                 generate_first_attr_derived_fn(builder, attribute)
+            } else if attribute.is_unit() {
+                generate_unit_attribute_fn(builder, attribute)
             } else {
                 generate_field_fn(builder, attribute, None)
             }
@@ -311,6 +313,33 @@ fn generate_first_attr_derived_fn(builder: &OperationBuilder, field: &Attribute)
                         _state: Default::default(),
                     }
                 }
+            }
+        }
+    }
+}
+
+// Mirrors C++'s `UnitAttr` `constBuilderCall`, which maps `bool` to attribute
+// presence. Intentionally a sibling of generate_field_fn for the same reason as
+// generate_same_operands_first_fn; a unit attribute is always optional, so only
+// the state-preserving form exists.
+fn generate_unit_attribute_fn(builder: &OperationBuilder, field: &Attribute) -> TokenStream {
+    let builder_identifier = builder.identifier();
+    let identifier = field.singular_identifier();
+    let parameter_type = field.parameter_type();
+    let argument = quote! { #identifier: #parameter_type };
+    let name = field.name();
+    let parameters = builder.type_state().parameters().collect::<Vec<_>>();
+
+    quote! {
+        impl<'c, #(#parameters),*> #builder_identifier<'c, #(#parameters),*> {
+            pub fn #identifier(mut self, #argument) -> #builder_identifier<'c, #(#parameters),*> {
+                if #identifier {
+                    self.inherent_attributes.push((
+                        #name,
+                        ::melior::ir::Attribute::unit(self.context),
+                    ));
+                }
+                self
             }
         }
     }

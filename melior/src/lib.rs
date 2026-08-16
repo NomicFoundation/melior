@@ -307,4 +307,43 @@ mod tests {
 
         assert!(operation.as_operation().verify());
     }
+
+    #[cfg(feature = "ods-dialects")]
+    #[test]
+    fn ods_builder_sets_unit_attribute() {
+        use crate::dialect::{llvm, ods::llvm::LLVMFuncOperation};
+
+        let context = Context::new();
+        load_all_dialects(&context);
+
+        let location = Location::unknown(&context);
+        let function = |dso_local| {
+            LLVMFuncOperation::builder(&context, location)
+                .sym_name(StringAttribute::new(&context, "f"))
+                .function_type(TypeAttribute::new(llvm::r#type::function(
+                    llvm::r#type::void(&context),
+                    &[],
+                    false,
+                )))
+                .body(Region::new())
+                .dso_local(dso_local)
+                .build()
+        };
+
+        assert!(function(true).dso_local());
+        assert!(!function(false).dso_local());
+        assert!(
+            function(true)
+                .as_operation()
+                .inherent_attribute("dso_local")
+                .is_ok()
+        );
+        assert!(
+            function(false)
+                .as_operation()
+                .inherent_attribute("dso_local")
+                .is_err()
+        );
+        assert!(function(true).as_operation().verify());
+    }
 }

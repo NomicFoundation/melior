@@ -20,7 +20,7 @@ fn generate_getter(attribute: &Attribute) -> TokenStream {
     let identifier = attribute.singular_identifier();
     let return_type = attribute.return_type();
     let body = if attribute.is_unit() {
-        quote! { self.operation.attribute(#name).is_some() }
+        quote! { self.operation.attribute(#name).is_ok() }
     } else {
         quote! { Ok(self.operation.attribute(#name)?.try_into()?) }
     };
@@ -39,9 +39,10 @@ fn generate_setter(attribute: &Attribute) -> TokenStream {
     let body = if attribute.is_unit() {
         quote! {
             if value {
-                self.operation.set_attribute(#name, Attribute::unit(self.operation.context()));
+                let context = unsafe { self.operation.context().to_ref() };
+                self.operation.set_attribute(#name, ::melior::ir::Attribute::unit(context));
             } else {
-                self.operation.remove_attribute(#name)
+                let _ = self.operation.remove_attribute(#name);
             }
         }
     } else {
